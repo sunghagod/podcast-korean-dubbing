@@ -1,0 +1,21 @@
+# YouTube download
+yt-dlp>=2024.1.0
+
+# Speech-to-Text (GPU)
+faster-whisper>=1.0.0
+
+# Translation
+deep-translator>=1.11.0
+
+# Text-to-Speech
+edge-tts>=6.1.0
+
+# Web UI
+gradio>=4.0.0
+
+# Audio processing
+pydub>=0.25.1
+ffmpeg-python>=0.2.0
+
+# Async utilities
+aiofiles>=23.0.0

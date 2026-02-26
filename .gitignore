@@ -1,0 +1,20 @@
+# Output files
+output/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Screenshots
+screenshot*.png
+
+# Temp files
+*.tmp
+*.log
+
+# Virtual environment
+venv/
+.venv/
+env/
