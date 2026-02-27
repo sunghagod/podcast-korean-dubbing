@@ -87,6 +87,84 @@ def _parse_json3_subtitle(json3_path: str) -> str:
     return full_text
 
 
+def download_reference_clip(url: str, output_dir: str, duration: int = 30) -> str:
+    """
+    Download the first `duration` seconds of a YouTube video as WAV for voice cloning.
+    Returns path to the WAV file named {video_id}_ref.wav.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(output_dir, "%(id)s_ref.%(ext)s"),
+        "download_ranges": yt_dlp.utils.download_range_func(None, [(0, duration)]),
+        "force_keyframes_at_cuts": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+                "preferredquality": "192",
+            }
+        ],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        video_id = info.get("id", "")
+
+    wav_path = os.path.join(output_dir, f"{video_id}_ref.wav")
+    if not os.path.exists(wav_path):
+        raise FileNotFoundError(f"Reference audio not found after download: {wav_path}")
+
+    return wav_path
+
+
+def download_voice_clip(url: str, start_sec: float, end_sec: float, output_path: str) -> str:
+    """
+    Download a specific time range from a YouTube video as WAV for voice cloning.
+
+    Args:
+        url: YouTube URL.
+        start_sec: Start time in seconds.
+        end_sec: End time in seconds.
+        output_path: Full path for the output WAV file.
+
+    Returns:
+        Path to the saved WAV file.
+    """
+    output_dir = os.path.dirname(output_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+
+    tmp_outtmpl = os.path.join(output_dir, "_voice_clip_tmp.%(ext)s")
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio/best",
+        "outtmpl": tmp_outtmpl,
+        "download_ranges": yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
+        "force_keyframes_at_cuts": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+                "preferredquality": "192",
+            }
+        ],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.extract_info(url, download=True)
+
+    tmp_wav = os.path.join(output_dir, "_voice_clip_tmp.wav")
+    if not os.path.exists(tmp_wav):
+        raise FileNotFoundError(f"클립 다운로드 실패: {tmp_wav}")
+
+    os.replace(tmp_wav, output_path)
+    return output_path
+
+
 def download_audio(url: str, output_dir: str) -> str:
     """
     Download best audio from YouTube and convert to WAV for Whisper.

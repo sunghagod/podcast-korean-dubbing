@@ -12,10 +12,16 @@ from typing import Dict, List, Optional
 
 import gradio as gr
 
+from modules.downloader import download_voice_clip
+from modules.transcriber import transcribe
 from pipeline import JobResult, Stage, process_urls_parallel
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
+CHECKPOINT_DIR = os.path.join(PROJECT_DIR, "checkpoints", "openaudio-s1-mini")
+VOICES_DIR = os.path.join(PROJECT_DIR, "references")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(VOICES_DIR, exist_ok=True)
 
 MAX_SLOTS = 3
 
@@ -55,23 +61,9 @@ def make_yt_player(uid: str, title: str, filepath: str) -> str:
     max-width:100%;
     margin-bottom:8px;
 ">
-  <!-- Cover art -->
-  <div style="
-      background:linear-gradient(160deg,#1c1c1c 0%,#080808 100%);
-      height:196px;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-  ">
-    <svg width="72" height="72" viewBox="0 0 72 72">
-      <circle cx="36" cy="36" r="36" fill="#212121"/>
-      <polygon points="27,19 27,53 53,36" fill="#ff0000"/>
-    </svg>
-  </div>
-
   <!-- Title -->
   <div style="
-      padding:14px 16px 4px;
+      padding:12px 16px 4px;
       font-size:15px;
       font-weight:500;
       white-space:nowrap;
@@ -324,6 +316,7 @@ def _stage_emoji(stage: Stage) -> str:
     return {
         Stage.PENDING: "⏳", Stage.FETCHING_INFO: "🔍",
         Stage.EXTRACTING_SUBTITLES: "📝", Stage.DOWNLOADING_AUDIO: "⬇️",
+        Stage.DOWNLOADING_REFERENCE: "🎵", Stage.REFERENCE_STT: "🔎",
         Stage.TRANSCRIBING: "🎙️", Stage.TRANSLATING: "🌐",
         Stage.GENERATING_TTS: "🔊", Stage.DONE: "✅", Stage.ERROR: "❌",
     }.get(stage, "•")
@@ -373,7 +366,18 @@ def _make_outputs(status="", snap=None, btn_interactive=True):
 
 # ── Processing ────────────────────────────────────────────────────────────────
 
-def start_processing(url_input, whisper_model, whisper_device, tts_rate):
+# (voice_id, pitch)
+VOICE_MAP = {
+    "여성 — SunHi": ("ko-KR-SunHiNeural", "+0Hz"),
+    "남성 — InJoon": ("ko-KR-InJoonNeural", "+0Hz"),
+    "남성 — InJoon (저음 -10Hz)": ("ko-KR-InJoonNeural", "-10Hz"),
+    "남성 — InJoon (극저음 -20Hz)": ("ko-KR-InJoonNeural", "-20Hz"),
+    "남성 — Hyunsu (다국어)": ("ko-KR-HyunsuMultilingualNeural", "+0Hz"),
+    "남성 — Hyunsu (저음 -10Hz)": ("ko-KR-HyunsuMultilingualNeural", "-10Hz"),
+}
+
+
+def start_processing(url_input, whisper_model, whisper_device, tts_rate, tts_voice_label, ref_voice_id, use_voice_cloning):
     global _jobs
     urls = _parse_urls(url_input)
     if not urls:
@@ -385,6 +389,17 @@ def start_processing(url_input, whisper_model, whisper_device, tts_rate):
 
     rate_map = {"느림 (-10%)": "-10%", "보통 (+0%)": "+0%", "빠름 (+15%)": "+15%", "매우 빠름 (+30%)": "+30%"}
     rate = rate_map.get(tts_rate, "+0%")
+    voice, pitch = VOICE_MAP.get(tts_voice_label, ("ko-KR-InJoonNeural", "+0Hz"))
+
+    # Resolve library voice reference files
+    lib_ref_audio, lib_ref_text = "", ""
+    if use_voice_cloning and ref_voice_id:
+        voice_dir = os.path.join(VOICES_DIR, ref_voice_id)
+        wav = os.path.join(voice_dir, "sample.wav")
+        lab = os.path.join(voice_dir, "sample.lab")
+        if os.path.exists(wav) and os.path.exists(lab):
+            lib_ref_audio = wav
+            lib_ref_text = open(lab, encoding="utf-8").read().strip()
 
     def progress_cb(job: JobResult):
         with _lock:
@@ -395,7 +410,14 @@ def start_processing(url_input, whisper_model, whisper_device, tts_rate):
         kwargs=dict(
             urls=urls, output_dir=OUTPUT_DIR,
             whisper_device=whisper_device, whisper_model=whisper_model,
-            tts_rate=rate, on_progress=progress_cb,
+            tts_rate=rate,
+            tts_voice=voice,
+            tts_pitch=pitch,
+            use_voice_cloning=use_voice_cloning,
+            checkpoint_dir=CHECKPOINT_DIR,
+            lib_ref_audio=lib_ref_audio,
+            lib_ref_text=lib_ref_text,
+            on_progress=progress_cb,
         ),
         daemon=True,
     )
@@ -412,16 +434,125 @@ def start_processing(url_input, whisper_model, whisper_device, tts_rate):
     yield _make_outputs(status=_build_status_md(snap), snap=snap, btn_interactive=True)
 
 
+# ── Voice Library ─────────────────────────────────────────────────────────────
+
+def _parse_time(s: str) -> float:
+    """Convert 'MM:SS', 'H:MM:SS', or plain seconds string to float seconds."""
+    s = s.strip()
+    parts = s.split(":")
+    try:
+        if len(parts) == 1:
+            return float(parts[0])
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        else:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        raise ValueError(f"시간 형식 오류: '{s}' — MM:SS 또는 초 단위로 입력하세요.")
+
+
+def _list_ref_voices() -> List[str]:
+    """Return names of all valid voice library entries."""
+    if not os.path.exists(VOICES_DIR):
+        return []
+    voices = []
+    for name in sorted(os.listdir(VOICES_DIR)):
+        d = os.path.join(VOICES_DIR, name)
+        if os.path.isdir(d):
+            wav = os.path.join(d, "sample.wav")
+            lab = os.path.join(d, "sample.lab")
+            if os.path.exists(wav) and os.path.exists(lab):
+                voices.append(name)
+    return voices
+
+
+def list_voice_library():
+    voices = _list_ref_voices()
+    if not voices:
+        md = "_등록된 목소리가 없습니다. 아래 폼으로 추가하세요._"
+    else:
+        rows = ["| # | 이름 | 크기 |", "|---|------|------|"]
+        for i, name in enumerate(voices, 1):
+            wav = os.path.join(VOICES_DIR, name, "sample.wav")
+            size_mb = os.path.getsize(wav) / 1024 / 1024 if os.path.exists(wav) else 0
+            rows.append(f"| {i} | **{name}** | {size_mb:.1f} MB |")
+        md = "\n".join(rows)
+    choices_update = gr.update(choices=voices, value=voices[0] if voices else None)
+    return md, choices_update, choices_update
+
+
+def add_voice_to_library(url, start_time, end_time, voice_name, whisper_device):
+    """Generator: downloads clip, transcribes it, saves to references/voice_name/."""
+    voice_name = (voice_name or "").strip()
+    if not voice_name:
+        yield "⚠️ 목소리 이름을 입력하세요.", *list_voice_library()
+        return
+    if not url or not url.strip():
+        yield "⚠️ YouTube URL을 입력하세요.", *list_voice_library()
+        return
+
+    voice_dir = os.path.join(VOICES_DIR, voice_name)
+    if os.path.exists(voice_dir):
+        yield f"⚠️ '{voice_name}' 이름이 이미 존재합니다. 다른 이름을 사용하세요.", *list_voice_library()
+        return
+
+    try:
+        start_sec = _parse_time(start_time)
+        end_sec = _parse_time(end_time)
+    except ValueError as e:
+        yield f"⚠️ {e}", *list_voice_library()
+        return
+
+    if end_sec <= start_sec:
+        yield "⚠️ 끝 시간이 시작 시간보다 커야 합니다.", *list_voice_library()
+        return
+    if end_sec - start_sec > 60:
+        yield "⚠️ 최대 60초 구간까지 지원합니다.", *list_voice_library()
+        return
+
+    os.makedirs(voice_dir, exist_ok=True)
+    wav_path = os.path.join(voice_dir, "sample.wav")
+    lab_path = os.path.join(voice_dir, "sample.lab")
+
+    try:
+        yield f"⬇️ 오디오 클립 다운로드 중... ({start_time} ~ {end_time})", *list_voice_library()
+        download_voice_clip(url.strip(), start_sec, end_sec, wav_path)
+
+        yield f"🎙️ STT 변환 중... (한국어)", *list_voice_library()
+        ref_text = transcribe(wav_path, device=whisper_device, language="ko")
+
+        with open(lab_path, "w", encoding="utf-8") as f:
+            f.write(ref_text)
+
+        yield f"✅ '{voice_name}' 등록 완료!\n\n**STT 결과:** {ref_text[:200]}", *list_voice_library()
+
+    except Exception as e:
+        import shutil
+        shutil.rmtree(voice_dir, ignore_errors=True)
+        yield f"❌ 오류: {e}", *list_voice_library()
+
+
+def delete_voice_from_library(voice_name):
+    if voice_name:
+        import shutil
+        shutil.rmtree(os.path.join(VOICES_DIR, voice_name), ignore_errors=True)
+    return list_voice_library()
+
+
 # ── History ───────────────────────────────────────────────────────────────────
 
-def list_history():
-    mp3_files = sorted(
+def _mp3_files() -> List[str]:
+    return sorted(
         [f for f in os.listdir(OUTPUT_DIR) if f.endswith(".mp3")],
         key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)),
         reverse=True,
     )
+
+
+def list_history():
+    mp3_files = _mp3_files()
     if not mp3_files:
-        return "_아직 생성된 파일이 없습니다._", ""
+        return "_아직 생성된 파일이 없습니다._", "", gr.update(choices=[], value=None)
 
     lines = ["| # | 파일명 | 크기 |", "|---|--------|------|"]
     for i, fname in enumerate(mp3_files[:10], 1):
@@ -432,7 +563,25 @@ def list_history():
     uid = get_uid(latest)
     title = re.sub(r"_[A-Za-z0-9_-]{8,12}\.mp3$", "", mp3_files[0]).replace("_", " ")
     player_html = make_yt_player(uid, title, latest)
-    return "\n".join(lines), player_html
+    return "\n".join(lines), player_html, gr.update(choices=mp3_files, value=mp3_files[0])
+
+
+def delete_file(fname: str):
+    if fname:
+        try:
+            os.remove(os.path.join(OUTPUT_DIR, fname))
+        except OSError:
+            pass
+    return list_history()
+
+
+def delete_all_files():
+    for f in _mp3_files():
+        try:
+            os.remove(os.path.join(OUTPUT_DIR, f))
+        except OSError:
+            pass
+    return list_history()
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
@@ -448,6 +597,15 @@ with gr.Blocks(title="🎙️ 팟캐스트 한국어 더빙") as demo:
                 placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/...",
                 lines=4,
             )
+            voice_clone_cb = gr.Checkbox(
+                label="🎤 원본 화자 목소리로 더빙 (Fish Speech — checkpoints/openaudio-s1-mini 필요)",
+                value=False,
+            )
+            ref_voice_selector = gr.Dropdown(
+                label="📚 라이브러리 목소리 선택 (voice cloning 활성 시 사용 — 비어있으면 영상에서 자동 추출)",
+                choices=_list_ref_voices(),
+                value=None,
+            )
             with gr.Row():
                 whisper_model = gr.Dropdown(
                     label="Whisper 모델", choices=["large-v3", "medium", "small", "base"], value="large-v3"
@@ -459,6 +617,11 @@ with gr.Blocks(title="🎙️ 팟캐스트 한국어 더빙") as demo:
                     label="TTS 속도",
                     choices=["느림 (-10%)", "보통 (+0%)", "빠름 (+15%)", "매우 빠름 (+30%)"],
                     value="보통 (+0%)",
+                )
+                tts_voice = gr.Dropdown(
+                    label="TTS 목소리",
+                    choices=list(VOICE_MAP.keys()),
+                    value="남성 — InJoon (극저음 -20Hz)",
                 )
             start_btn = gr.Button("🚀 처리 시작", variant="primary", size="lg")
 
@@ -486,12 +649,61 @@ with gr.Blocks(title="🎙️ 팟캐스트 한국어 더빙") as demo:
             slot_en_texts.append(en_text)
             slot_groups.append(grp)
 
+    with gr.Tab("🎤 목소리 라이브러리"):
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.Markdown("### 새 목소리 추가")
+                lib_url = gr.Textbox(label="YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
+                with gr.Row():
+                    lib_start = gr.Textbox(label="시작 시간 (MM:SS)", placeholder="0:30", scale=1)
+                    lib_end   = gr.Textbox(label="끝 시간 (MM:SS)", placeholder="1:00", scale=1)
+                    lib_name  = gr.Textbox(label="목소리 이름", placeholder="나레이터", scale=2)
+                lib_device = gr.Dropdown(label="STT 장치", choices=["cuda", "cpu"], value="cuda")
+                with gr.Row():
+                    lib_add_btn    = gr.Button("🎙️ 목소리 추출 & 등록", variant="primary")
+                    lib_delete_btn = gr.Button("🗑️ 선택 삭제", variant="stop")
+                lib_status = gr.Markdown("_URL과 구간을 입력하고 '목소리 추출 & 등록'을 클릭하세요._")
+
+            with gr.Column(scale=3):
+                gr.Markdown("### 등록된 목소리")
+                lib_table      = gr.Markdown()
+                lib_selector   = gr.Dropdown(label="삭제할 목소리 선택", choices=[])
+                lib_refresh_btn = gr.Button("🔄 새로고침")
+
+        lib_add_outputs    = [lib_status, lib_table, lib_selector, ref_voice_selector]
+        lib_delete_outputs = [lib_table, lib_selector, ref_voice_selector]
+
+        def _list_voice_library_3():
+            md, sel, main = list_voice_library()
+            return md, sel, main
+
+        def _delete_voice(name):
+            md, sel, main = delete_voice_from_library(name)
+            return md, sel, main
+
+        lib_add_btn.click(
+            fn=add_voice_to_library,
+            inputs=[lib_url, lib_start, lib_end, lib_name, lib_device],
+            outputs=lib_add_outputs,
+        )
+        lib_delete_btn.click(fn=_delete_voice, inputs=[lib_selector], outputs=lib_delete_outputs)
+        lib_refresh_btn.click(fn=_list_voice_library_3, outputs=lib_delete_outputs)
+        demo.load(fn=_list_voice_library_3, outputs=lib_delete_outputs)
+
     with gr.Tab("처리 히스토리"):
         history_md     = gr.Markdown()
         history_player = gr.HTML()
-        refresh_btn    = gr.Button("🔄 새로고침")
-        refresh_btn.click(fn=list_history, outputs=[history_md, history_player])
-        demo.load(fn=list_history, outputs=[history_md, history_player])
+        with gr.Row():
+            file_selector  = gr.Dropdown(label="파일 선택", choices=[], scale=3)
+            delete_btn     = gr.Button("🗑️ 선택 삭제", variant="stop", scale=1)
+            delete_all_btn = gr.Button("🗑️ 전체 삭제", variant="stop", scale=1)
+            refresh_btn    = gr.Button("🔄 새로고침", scale=1)
+
+        history_outputs = [history_md, history_player, file_selector]
+        refresh_btn.click(fn=list_history, outputs=history_outputs)
+        delete_btn.click(fn=delete_file, inputs=[file_selector], outputs=history_outputs)
+        delete_all_btn.click(fn=delete_all_files, outputs=history_outputs)
+        demo.load(fn=list_history, outputs=history_outputs)
 
     # Wire outputs
     all_outputs = [status_md, start_btn]
@@ -500,7 +712,7 @@ with gr.Blocks(title="🎙️ 팟캐스트 한국어 더빙") as demo:
 
     start_btn.click(
         fn=start_processing,
-        inputs=[url_input, whisper_model, whisper_device, tts_rate],
+        inputs=[url_input, whisper_model, whisper_device, tts_rate, tts_voice, ref_voice_selector, voice_clone_cb],
         outputs=all_outputs,
     )
 

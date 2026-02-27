@@ -1,6 +1,12 @@
 # Output files
 output/
 
+# Large model checkpoints (download separately via HuggingFace)
+checkpoints/
+
+# Voice library reference audio (user-generated, not tracked)
+references/
+
 # Python cache
 __pycache__/
 *.pyc

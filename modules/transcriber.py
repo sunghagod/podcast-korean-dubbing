@@ -30,19 +30,21 @@ def transcribe(
     audio_path: str,
     model_size: str = "large-v3",
     device: str = "cuda",
+    language: str = "en",
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     """
-    Transcribe an audio file to English text.
+    Transcribe an audio file to text.
 
     Args:
         audio_path: Path to WAV/MP3 audio file.
         model_size: Whisper model size (default: large-v3).
         device: 'cuda' or 'cpu'.
+        language: Language code (e.g. 'en', 'ko').
         progress_callback: Optional function called with status strings.
 
     Returns:
-        Transcribed English text as a single string.
+        Transcribed text as a single string.
     """
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -54,7 +56,7 @@ def transcribe(
 
     segments, info = model.transcribe(
         audio_path,
-        language="en",
+        language=language,
         beam_size=5,
         vad_filter=True,  # Skip silent parts
         vad_parameters={"min_silence_duration_ms": 500},

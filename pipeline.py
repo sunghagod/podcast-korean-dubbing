@@ -14,10 +14,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from modules.downloader import get_video_info, extract_subtitles, download_audio
+from deep_translator import GoogleTranslator
+
+from modules.downloader import get_video_info, extract_subtitles, download_audio, download_reference_clip
 from modules.transcriber import transcribe
 from modules.translator import translate
-from modules.tts import generate_tts
+from modules.tts import generate_tts, generate_tts_fish_speech
 
 
 class Stage(str, Enum):
@@ -25,6 +27,8 @@ class Stage(str, Enum):
     FETCHING_INFO = "영상 정보 가져오는 중"
     EXTRACTING_SUBTITLES = "자막 추출 중"
     DOWNLOADING_AUDIO = "오디오 다운로드 중"
+    DOWNLOADING_REFERENCE = "레퍼런스 오디오 추출 중"
+    REFERENCE_STT = "레퍼런스 STT 중"
     TRANSCRIBING = "STT 변환 중"
     TRANSLATING = "한국어 번역 중"
     GENERATING_TTS = "TTS 생성 중"
@@ -59,12 +63,27 @@ def _sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", name)[:80]
 
 
+def _translate_title(title: str) -> str:
+    """Translate an English video title to a concise Korean title."""
+    try:
+        translator = GoogleTranslator(source="en", target="ko")
+        return translator.translate(title) or title
+    except Exception:
+        return title
+
+
 def process_single_url(
     url: str,
     output_dir: str,
     whisper_device: str = "cuda",
     whisper_model: str = "large-v3",
     tts_rate: str = "+0%",
+    tts_voice: str = "ko-KR-SunHiNeural",
+    tts_pitch: str = "+0Hz",
+    use_voice_cloning: bool = False,
+    checkpoint_dir: str = "",
+    lib_ref_audio: str = "",
+    lib_ref_text: str = "",
     on_progress: Optional[Callable[[JobResult], None]] = None,
 ) -> JobResult:
     """
@@ -76,6 +95,9 @@ def process_single_url(
         whisper_device: 'cuda' or 'cpu'.
         whisper_model: Whisper model size.
         tts_rate: TTS speech rate (e.g. '+0%').
+        tts_voice: edge-tts voice name (e.g. 'ko-KR-SunHiNeural', 'ko-KR-InJoonNeural').
+        use_voice_cloning: If True, use Fish Speech for voice-cloned TTS.
+        checkpoint_dir: Path to openaudio-s1-mini checkpoint directory.
         on_progress: Callback invoked whenever job state changes.
 
     Returns:
@@ -92,6 +114,9 @@ def process_single_url(
         if on_progress:
             on_progress(job)
 
+    ref_wav: Optional[str] = None
+    _cleanup_ref_wav = False  # only cleanup ref we downloaded ourselves
+
     try:
         # 1. Fetch video metadata
         update(Stage.FETCHING_INFO)
@@ -99,6 +124,32 @@ def process_single_url(
         job.title = info["title"]
         video_id = info["id"]
         safe_title = _sanitize_filename(job.title)
+
+        # 1b. Reference audio for voice cloning
+        ref_text = ""
+        if use_voice_cloning and checkpoint_dir:
+            if lib_ref_audio and lib_ref_text and os.path.exists(lib_ref_audio):
+                # Use pre-existing library voice — no download needed
+                ref_wav = lib_ref_audio
+                ref_text = lib_ref_text
+            else:
+                update(Stage.DOWNLOADING_REFERENCE, "레퍼런스 오디오 30초 다운로드 중...")
+                try:
+                    ref_wav = download_reference_clip(url, temp_dir, duration=30)
+                    _cleanup_ref_wav = True
+                    update(Stage.REFERENCE_STT, "레퍼런스 STT 실행 중...")
+                    ref_text = transcribe(
+                        ref_wav,
+                        model_size=whisper_model,
+                        device=whisper_device,
+                    )
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "레퍼런스 오디오/STT 실패, edge-tts로 fallback: %s", e
+                    )
+                    use_voice_cloning = False
+                    ref_wav = None
 
         # 2. Try to get subtitles
         update(Stage.EXTRACTING_SUBTITLES)
@@ -140,19 +191,48 @@ def process_single_url(
         )
 
         # 5. Generate TTS
-        output_filename = f"{safe_title}_{video_id}.mp3"
+        korean_title = _translate_title(job.title)
+        safe_korean_title = _sanitize_filename(korean_title)
+        output_filename = f"{safe_korean_title}_{video_id}.mp3"
         output_path = os.path.join(output_dir, output_filename)
 
         def tts_progress(msg: str) -> None:
             update(Stage.GENERATING_TTS, msg)
 
         update(Stage.GENERATING_TTS, "TTS 시작...")
-        generate_tts(
-            job.korean_text,
-            output_path,
-            rate=tts_rate,
-            progress_callback=tts_progress,
-        )
+        if use_voice_cloning and ref_wav and ref_text and checkpoint_dir:
+            try:
+                generate_tts_fish_speech(
+                    job.korean_text,
+                    output_path,
+                    reference_audio_path=ref_wav,
+                    reference_text=ref_text,
+                    checkpoint_dir=checkpoint_dir,
+                    rate=tts_rate,
+                    progress_callback=tts_progress,
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Fish Speech TTS 실패, edge-tts로 fallback: %s", e
+                )
+                generate_tts(
+                    job.korean_text,
+                    output_path,
+                    rate=tts_rate,
+                    voice=tts_voice,
+                    pitch=tts_pitch,
+                    progress_callback=tts_progress,
+                )
+        else:
+            generate_tts(
+                job.korean_text,
+                output_path,
+                rate=tts_rate,
+                voice=tts_voice,
+                pitch=tts_pitch,
+                progress_callback=tts_progress,
+            )
         job.audio_path = output_path
 
         job.end_time = time.time()
@@ -164,6 +244,13 @@ def process_single_url(
         job.end_time = time.time()
         if on_progress:
             on_progress(job)
+    finally:
+        # Only cleanup reference audio we downloaded ourselves
+        if ref_wav and _cleanup_ref_wav:
+            try:
+                os.remove(ref_wav)
+            except OSError:
+                pass
 
     return job
 
@@ -174,6 +261,12 @@ def process_urls_parallel(
     whisper_device: str = "cuda",
     whisper_model: str = "large-v3",
     tts_rate: str = "+0%",
+    tts_voice: str = "ko-KR-SunHiNeural",
+    tts_pitch: str = "+0Hz",
+    use_voice_cloning: bool = False,
+    checkpoint_dir: str = "",
+    lib_ref_audio: str = "",
+    lib_ref_text: str = "",
     max_workers: int = 3,
     on_progress: Optional[Callable[[JobResult], None]] = None,
 ) -> Dict[str, JobResult]:
@@ -201,6 +294,12 @@ def process_urls_parallel(
                 whisper_device,
                 whisper_model,
                 tts_rate,
+                tts_voice,
+                tts_pitch,
+                use_voice_cloning,
+                checkpoint_dir,
+                lib_ref_audio,
+                lib_ref_text,
                 progress_handler,
             ): url
             for url in urls
