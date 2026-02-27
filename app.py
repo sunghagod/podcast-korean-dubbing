@@ -23,6 +23,25 @@ VOICES_DIR = os.path.join(PROJECT_DIR, "references")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(VOICES_DIR, exist_ok=True)
 
+
+def _load_config_env() -> dict:
+    """config.env 파일에서 KEY=VALUE 형식의 설정을 읽어 반환."""
+    config = {}
+    config_path = os.path.join(PROJECT_DIR, "config.env")
+    if os.path.exists(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    config[key.strip()] = value.strip()
+    return config
+
+
+_CONFIG = _load_config_env()
+DEFAULT_CLAUDE_KEY = _CONFIG.get("CLAUDE_API_KEY", "")
+DEFAULT_ASSEMBLYAI_KEY = _CONFIG.get("ASSEMBLYAI_API_KEY", "")
+
 MAX_SLOTS = 3
 
 _jobs: Dict[str, JobResult] = {}
@@ -377,11 +396,16 @@ VOICE_MAP = {
 }
 
 
-def start_processing(url_input, whisper_model, whisper_device, tts_rate, tts_voice_label, ref_voice_id, use_voice_cloning):
+def start_processing(url_input, whisper_model, whisper_device, tts_rate, tts_voice_label, ref_voice_id, use_voice_cloning,
+                     claude_api_key, use_diarization, assemblyai_api_key):
     global _jobs
     urls = _parse_urls(url_input)
     if not urls:
         yield _make_outputs(status="⚠️ 유효한 YouTube URL을 입력해 주세요.", btn_interactive=True)
+        return
+
+    if use_diarization and not (assemblyai_api_key or "").strip():
+        yield _make_outputs(status="⚠️ 화자 구분 더빙을 사용하려면 AssemblyAI API 키를 입력해 주세요.", btn_interactive=True)
         return
 
     with _lock:
@@ -417,6 +441,9 @@ def start_processing(url_input, whisper_model, whisper_device, tts_rate, tts_voi
             checkpoint_dir=CHECKPOINT_DIR,
             lib_ref_audio=lib_ref_audio,
             lib_ref_text=lib_ref_text,
+            use_diarization=use_diarization,
+            assemblyai_api_key=(assemblyai_api_key or "").strip(),
+            claude_api_key=(claude_api_key or "").strip(),
             on_progress=progress_cb,
         ),
         daemon=True,
@@ -552,7 +579,7 @@ def _mp3_files() -> List[str]:
 def list_history():
     mp3_files = _mp3_files()
     if not mp3_files:
-        return "_아직 생성된 파일이 없습니다._", "", gr.update(choices=[], value=None)
+        return "_아직 생성된 파일이 없습니다._", "", gr.update(choices=[], value=None), gr.update(value=None, visible=False)
 
     lines = ["| # | 파일명 | 크기 |", "|---|--------|------|"]
     for i, fname in enumerate(mp3_files[:10], 1):
@@ -563,7 +590,21 @@ def list_history():
     uid = get_uid(latest)
     title = re.sub(r"_[A-Za-z0-9_-]{8,12}\.mp3$", "", mp3_files[0]).replace("_", " ")
     player_html = make_yt_player(uid, title, latest)
-    return "\n".join(lines), player_html, gr.update(choices=mp3_files, value=mp3_files[0])
+    return "\n".join(lines), player_html, gr.update(choices=mp3_files, value=mp3_files[0]), gr.update(value=latest, visible=True)
+
+
+def _get_download_path(fname: str):
+    if fname:
+        path = os.path.join(OUTPUT_DIR, fname)
+        if os.path.exists(path):
+            return gr.update(value=path, visible=True)
+    return gr.update(value=None, visible=False)
+
+
+def open_output_folder():
+    import subprocess
+    folder = OUTPUT_DIR.replace("/", "\\")
+    subprocess.Popen(["explorer", folder])
 
 
 def delete_file(fname: str):
@@ -605,6 +646,28 @@ with gr.Blocks(title="🎙️ 팟캐스트 한국어 더빙") as demo:
                 label="📚 라이브러리 목소리 선택 (voice cloning 활성 시 사용 — 비어있으면 영상에서 자동 추출)",
                 choices=_list_ref_voices(),
                 value=None,
+            )
+            claude_key_input = gr.Textbox(
+                label="🤖 Claude API 키 (번역 품질 향상 — 없으면 Google 번역 사용)",
+                placeholder="sk-ant-...",
+                type="password",
+                value=DEFAULT_CLAUDE_KEY,
+            )
+            diarization_cb = gr.Checkbox(
+                label="🎙️ 화자 구분 더빙 (AssemblyAI — 인터뷰어/게스트 목소리 분리)",
+                value=False,
+            )
+            assemblyai_key_input = gr.Textbox(
+                label="AssemblyAI API 키",
+                placeholder="your_assemblyai_api_key_here",
+                type="password",
+                visible=False,
+                value=DEFAULT_ASSEMBLYAI_KEY,
+            )
+            diarization_cb.change(
+                fn=lambda checked: gr.update(visible=checked),
+                inputs=[diarization_cb],
+                outputs=[assemblyai_key_input],
             )
             with gr.Row():
                 whisper_model = gr.Dropdown(
@@ -694,15 +757,19 @@ with gr.Blocks(title="🎙️ 팟캐스트 한국어 더빙") as demo:
         history_md     = gr.Markdown()
         history_player = gr.HTML()
         with gr.Row():
-            file_selector  = gr.Dropdown(label="파일 선택", choices=[], scale=3)
+            file_selector  = gr.Dropdown(label="파일 선택", choices=[], scale=4)
+            open_folder_btn = gr.Button("📂 폴더 열기", scale=1)
             delete_btn     = gr.Button("🗑️ 선택 삭제", variant="stop", scale=1)
             delete_all_btn = gr.Button("🗑️ 전체 삭제", variant="stop", scale=1)
             refresh_btn    = gr.Button("🔄 새로고침", scale=1)
+        download_file = gr.File(label="⬇️ 다운로드", interactive=False, visible=False)
 
-        history_outputs = [history_md, history_player, file_selector]
+        history_outputs = [history_md, history_player, file_selector, download_file]
         refresh_btn.click(fn=list_history, outputs=history_outputs)
         delete_btn.click(fn=delete_file, inputs=[file_selector], outputs=history_outputs)
         delete_all_btn.click(fn=delete_all_files, outputs=history_outputs)
+        file_selector.change(fn=_get_download_path, inputs=[file_selector], outputs=[download_file])
+        open_folder_btn.click(fn=open_output_folder)
         demo.load(fn=list_history, outputs=history_outputs)
 
     # Wire outputs
@@ -712,7 +779,8 @@ with gr.Blocks(title="🎙️ 팟캐스트 한국어 더빙") as demo:
 
     start_btn.click(
         fn=start_processing,
-        inputs=[url_input, whisper_model, whisper_device, tts_rate, tts_voice, ref_voice_selector, voice_clone_cb],
+        inputs=[url_input, whisper_model, whisper_device, tts_rate, tts_voice, ref_voice_selector, voice_clone_cb,
+                claude_key_input, diarization_cb, assemblyai_key_input],
         outputs=all_outputs,
     )
 
@@ -720,7 +788,7 @@ if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=False,
+        share=True,
         allowed_paths=[OUTPUT_DIR],
         js=GLOBAL_JS,
     )

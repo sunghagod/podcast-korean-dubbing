@@ -19,3 +19,9 @@ ffmpeg-python>=0.2.0
 
 # Async utilities
 aiofiles>=23.0.0
+
+# Speaker diarization (optional)
+assemblyai
+
+# Claude API translation (optional)
+anthropic
